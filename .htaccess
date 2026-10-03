@@ -1,0 +1,19 @@
+# 禁止访问敏感目录
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    # 屏蔽 config / includes / install
+    RewriteRule ^(config|includes|install|logs)/ - [F,L]
+</IfModule>
+
+<IfModule mod_rewrite.c>
+    RewriteRule ^index\.php$ - [L]
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^(.*)$ index.php?$1 [L]
+</IfModule>
+
+# 默认首页
+DirectoryIndex index.php index.html
+
+# 关闭目录列表
+Options -Indexes
