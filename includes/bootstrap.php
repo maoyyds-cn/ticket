@@ -5,7 +5,7 @@
 declare(strict_types=1);
 
 define('APP_ROOT', dirname(__DIR__));
-define('APP_VER', '1.1.0');
+define('APP_VER', '1.2.0');
 define('APP_PATH', APP_ROOT . DIRECTORY_SEPARATOR . 'includes');
 define('UPLOAD_PATH', APP_ROOT . DIRECTORY_SEPARATOR . 'uploads');
 define('TPL_PATH', APP_ROOT . DIRECTORY_SEPARATOR . 'templates');
@@ -196,6 +196,14 @@ register_shutdown_function(static function (): void {
     if ($e !== null && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
         return;
     }
+
+    // 会话必须先落盘并释放锁，再去发邮件。
+    // 否则用户在拿到页面后立刻点链接，下一个请求会因会话文件仍被本进程
+    // 锁住而阻塞，直到整个邮件队列发完——异步优化反而制造了一个新的卡顿。
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+
     mail_flush_response();
     mail_queue_flush();
 });

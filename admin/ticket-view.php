@@ -85,7 +85,9 @@ if (is_post()) {
             }
 
             ticket_add_log($id, 'reply', ($internal ? '添加内部备注：' : '回复用户：') . mb_strimwidth($content, 0, 100, '…'));
-            flash('ok', $internal ? '内部备注已添加' : '回复已发送，用户已收到邮件通知');
+            // 通知邮件改在响应发出后异步发送，这里无法得知成败，
+            // 所以不能断言「用户已收到」。实际结果看 mail_log。
+            flash('ok', $internal ? '内部备注已添加' : '回复已发送，通知邮件已在后台排队发送');
             if ($attErrs) {
                 flash('error', '部分附件未上传：' . implode('；', $attErrs));
             }

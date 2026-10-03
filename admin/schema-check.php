@@ -36,6 +36,9 @@ function schema_required(): array
         'category'    => ['id', 'name', 'is_ticket'],
         'user'        => ['id', 'username', 'password'],
         'settings'    => ['skey', 'svalue'],
+        // 发信日志：通知邮件改为异步发送后，失败与否只能看这张表，
+        // 缺表等于完全没有发信可观测性
+        'mail_log'    => ['id', 'to_email', 'subject', 'status', 'error', 'created_at'],
     ];
 }
 
@@ -110,6 +113,28 @@ if (is_post()) {
         $done[] = 'admin.role 枚举已扩展为 5 种角色';
     } catch (PDOException $e) {
         $fail[] = '扩展 role 枚举失败：' . $e->getMessage();
+    }
+
+    // 1.5) 补建 mail_log 表。这张表只在 install/schema.sql 里出现过，
+    //      老站点后来升级代码的路径上不会建它，而通知邮件改成异步发送后
+    //      发信成败只落在这张表上——缺表就等于完全没有可观测性。
+    //      结构与 install/schema.sql 保持一致，CREATE TABLE IF NOT EXISTS
+    //      重复执行无副作用。
+    try {
+        $pdo->exec('CREATE TABLE IF NOT EXISTS `' . DB_PRE . 'mail_log` (
+            `id`         INT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `ticket_id`  INT UNSIGNED NOT NULL DEFAULT 0,
+            `to_email`   VARCHAR(120) NOT NULL,
+            `subject`    VARCHAR(200) NOT NULL DEFAULT \'\',
+            `status`     TINYINT(1) NOT NULL DEFAULT 0 COMMENT \'1成功 0失败\',
+            `error`      VARCHAR(500) NOT NULL DEFAULT \'\',
+            `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_mail_time` (`created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT=\'邮件发送记录\'');
+        $done[] = DB_PRE . 'mail_log 表已就绪';
+    } catch (PDOException $e) {
+        $fail[] = '创建 mail_log 表失败：' . $e->getMessage();
     }
 
     // 2) 补 author_role 列。先查 INFORMATION_SCHEMA 再 ALTER，

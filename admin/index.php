@@ -60,9 +60,43 @@ $byCat = db_all('SELECT c.name, c.icon, c.color, COUNT(t.id) c FROM ' . DB_PRE .
                  LEFT JOIN ' . DB_PRE . 'ticket t ON t.category_id = c.id
                  GROUP BY c.id ORDER BY c DESC LIMIT 7');
 
+// 近 24 小时发信失败数。通知邮件改为响应发出后异步发送，发信结果
+// 不再有任何同步反馈给页面，失败只会落在 mail_log 里。不在这里露出来，
+// 就变成「用户没收到邮件、客服完全不知道」的静默故障。
+//
+// 包 try/catch：mail_log 只在 install/schema.sql 里建过，老站点升级代码
+// 后可能没有这张表，而 db() 是 ERRMODE_EXCEPTION——不兜住会让整个
+// 后台首页 500 白屏。仪表盘缺一个提示块不该拖垮整页。
+$mailFail = 0;
+$mailFailRow = null;
+try {
+    $mailFail = (int)db_one('SELECT COUNT(*) FROM ' . DB_PRE . 'mail_log
+                             WHERE status = 0 AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)', [], 0);
+    $mailFailRow = $mailFail > 0
+        ? db_row('SELECT to_email, subject, error, created_at FROM ' . DB_PRE . 'mail_log
+                  WHERE status = 0 ORDER BY id DESC LIMIT 1')
+        : null;
+} catch (PDOException $e) {
+    // 缺表只是看不到提示，交给「结构自检」去补
+}
+
 $pageTitle = '数据概览';
 require __DIR__ . '/_head.php';
 ?>
+
+<?php if ($mailFail > 0): ?>
+  <div class="alert alert-warn">
+    <span class="ic">⚠</span>
+    <div>
+      近 24 小时有 <strong><?= $mailFail ?></strong> 封通知邮件发送失败。
+      通知邮件在页面响应发出后才投递，失败不会打断业务，也不会提示用户，
+      需要在这里查看。最近一次：<code class="mono"><?= e((string)($mailFailRow['to_email'] ?? '')) ?></code>
+      —— <?= e((string)($mailFailRow['error'] ?? '')) ?>
+      （<?= e(time_ago((string)($mailFailRow['created_at'] ?? ''))) ?>）
+      <a href="mail.php">查看发信记录与失败原因</a>
+    </div>
+  </div>
+<?php endif; ?>
 
 <div class="stats">
   <div class="stat" style="color:var(--brand)">

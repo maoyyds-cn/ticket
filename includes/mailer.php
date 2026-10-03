@@ -252,7 +252,7 @@ function smtp_send(string $from, string $fromName, string $to, string $subject, 
         if ($remain <= 0.2) {
             return ['ok' => false, 'msg' => "SMTP {$step} 超时：整封邮件耗时已超过 " . MAIL_SMTP_BUDGET . ' 秒预算'];
         }
-        stream_set_timeout($fp, (int)max(1, ceil($remain)));
+        @stream_set_timeout($fp, (int)max(1, ceil($remain)));
         $l = @fgets($fp, 1024);
         if ($l === false) {
             $meta = stream_get_meta_data($fp);
@@ -286,9 +286,45 @@ function smtp_send(string $from, string $fromName, string $to, string $subject, 
         return ['ok' => false, 'msg' => "SMTP {$step} 失败：{$line}"];
     };
 
-    $cmd = static function ($fp, string $line) {
-        $r = @fwrite($fp, $line . "\r\n");
-        return $r === false ? ['ok' => false, 'msg' => "SMTP 写入失败：{$line}"] : ['ok' => true, 'msg' => ''];
+    // 写入同样要受预算约束。fwrite 在阻塞式 socket 上遇到 TCP 零窗口
+    // 会一直挂着，而写正文那一次（DATA 之后）可达数十 KB，是最容易卡住的地方。
+    // stream_set_timeout 也会设 SO_SNDTIMEO，但它的值是上一次读时的剩余预算，
+    // 不重新算就可能超发，所以这里每次写都重设一次。
+    $cmd = static function ($fp, string $line) use ($left) {
+        if ($left() <= 0.2) {
+            return ['ok' => false, 'msg' => 'SMTP 写入超时：整封邮件耗时已超过 ' . MAIL_SMTP_BUDGET . ' 秒预算'];
+        }
+
+        // 必须循环补写。fwrite 只判断「是否返回 false」是不够的：
+        // 套接字缓冲区满时 PHP 会提前返回，此时返回值是小于请求长度的
+        // 正整数（部分写入），不等于 false，会被误判为成功。
+        // DATA 之后那次写入可达数十 KB，一旦截断，服务器仍可能回 250，
+        // 结果是邮件正文残缺而日志显示「发送成功」。
+        $data = $line . "\r\n";
+        $len  = strlen($data);
+        $sent = 0;
+        while ($sent < $len) {
+            $remain = $left();
+            if ($remain <= 0.2) {
+                return ['ok' => false, 'msg' => 'SMTP 写入超时：整封邮件耗时已超过 ' . MAIL_SMTP_BUDGET . ' 秒预算'];
+            }
+            @stream_set_timeout($fp, (int)max(1, ceil($remain)));
+            $n = @fwrite($fp, substr($data, $sent));
+            if ($n === false || $n === 0) {
+                return ['ok' => false, 'msg' => "SMTP 写入失败：{$line}"];
+            }
+            $sent += $n;
+        }
+        return ['ok' => true, 'msg' => ''];
+    };
+
+    // 写入后必须检查结果。原先 13 处调用都丢弃 $cmd 的返回值，
+    // 写成「预算耗尽」也继续往下走，靠下一个 $expect 才偶然失败——
+    // DATA 之后那次失败会丢掉整篇正文，日志里看不出是哪一步超的。
+    // 统一用 $send 写：写不进去立刻结束会话。
+    $send = static function ($fp, string $line) use ($cmd, $fail): array {
+        $r = $cmd($fp, $line);
+        return $r['ok'] ? ['ok' => true, 'msg' => ''] : $fail($r['msg']);
     };
 
     // 1. 握手
@@ -297,11 +333,17 @@ function smtp_send(string $from, string $fromName, string $to, string $subject, 
         return $fail($r['msg']);
     }
 
-    $r = $cmd($fp, 'EHLO ' . $hostName);
+    $r = $send($fp, 'EHLO ' . $hostName);
+    if (!$r['ok']) {
+        return $r;
+    }
     $r = $expect($fp, [250], 'EHLO');
     if (!$r['ok']) {
         // 部分服务器不支持 EHLO，退回 HELO
-        $cmd($fp, 'HELO ' . $hostName);
+        $r = $send($fp, 'HELO ' . $hostName);
+        if (!$r['ok']) {
+            return $r;
+        }
         $r = $expect($fp, [250], 'HELO');
         if (!$r['ok']) {
             return $fail($r['msg']);
@@ -310,7 +352,10 @@ function smtp_send(string $from, string $fromName, string $to, string $subject, 
 
     // 2. STARTTLS（隐式 SSL 模式跳过）
     if ($useSsl && !$useImplicitTls) {
-        $cmd($fp, 'STARTTLS');
+        $r = $send($fp, 'STARTTLS');
+        if (!$r['ok']) {
+            return $r;
+        }
         $r = $expect($fp, [220], 'STARTTLS');
         if (!$r['ok']) {
             return $fail($r['msg']);
@@ -325,12 +370,17 @@ function smtp_send(string $from, string $fromName, string $to, string $subject, 
         if (!@stream_socket_enable_crypto($fp, true, $crypto)) {
             return $fail('STARTTLS 加密协商失败，请确认服务器端口与加密方式（465/SSL 或 587/STARTTLS）是否匹配');
         }
-        // 加密协商本身也消耗预算，且不受 stream_set_timeout 约束
+        // 加密协商本身也消耗预算，且不受 stream_set_timeout 约束。
+        // 这里是事后检查，只能记失败——PHP 的 TLS 握手有自己的超时，
+        // 阻塞中的握手无法从外部中断，所以预算对这一步只是软上限。
         if ($left() <= 0.2) {
             return $fail('SMTP STARTTLS 超时：加密协商耗时已超过 ' . MAIL_SMTP_BUDGET . ' 秒预算');
         }
         // 加密后需重新握手
-        $cmd($fp, 'EHLO ' . $hostName);
+        $r = $send($fp, 'EHLO ' . $hostName);
+        if (!$r['ok']) {
+            return $r;
+        }
         $r = $expect($fp, [250], 'EHLO(TLS)');
         if (!$r['ok']) {
             return $fail($r['msg']);
@@ -343,13 +393,22 @@ function smtp_send(string $from, string $fromName, string $to, string $subject, 
         $authPass = base64_encode($pass);
 
         // 优先尝试 AUTH LOGIN
-        $cmd($fp, 'AUTH LOGIN');
+        $r = $send($fp, 'AUTH LOGIN');
+        if (!$r['ok']) {
+            return $r;
+        }
         $r = $expect($fp, [334], 'AUTH LOGIN');
         if ($r['ok']) {
-            $cmd($fp, $authUser);
+            $r = $send($fp, $authUser);
+            if (!$r['ok']) {
+                return $r;
+            }
             $r = $expect($fp, [334], 'AUTH 用户名');
             if ($r['ok']) {
-                $cmd($fp, $authPass);
+                $r = $send($fp, $authPass);
+                if (!$r['ok']) {
+                    return $r;
+                }
                 $r = $expect($fp, [235], 'AUTH 密码');
                 if (!$r['ok']) {
                     return $fail('认证失败：' . $r['msg'] . '（请确认授权码/密码是否正确）');
@@ -359,7 +418,10 @@ function smtp_send(string $from, string $fromName, string $to, string $subject, 
             }
         } else {
             // 回退 PLAIN
-            $cmd($fp, 'AUTH PLAIN ' . base64_encode("\0" . $user . "\0" . $pass));
+            $r = $send($fp, 'AUTH PLAIN ' . base64_encode("\0" . $user . "\0" . $pass));
+            if (!$r['ok']) {
+                return $r;
+            }
             $r = $expect($fp, [235], 'AUTH PLAIN');
             if (!$r['ok']) {
                 return $fail('认证失败：' . $r['msg'] . '（请确认授权码/密码是否正确）');
@@ -368,27 +430,41 @@ function smtp_send(string $from, string $fromName, string $to, string $subject, 
     }
 
     // 4. 发信
-    $cmd($fp, 'MAIL FROM:<' . $from . '>');
+    $r = $send($fp, 'MAIL FROM:<' . $from . '>');
+    if (!$r['ok']) {
+        return $r;
+    }
     $r = $expect($fp, [250], 'MAIL FROM');
     if (!$r['ok']) {
         return $fail($r['msg']);
     }
 
-    $cmd($fp, 'RCPT TO:<' . $to . '>');
+    $r = $send($fp, 'RCPT TO:<' . $to . '>');
+    if (!$r['ok']) {
+        return $r;
+    }
     $r = $expect($fp, [250, 251], 'RCPT TO');
     if (!$r['ok']) {
         return $fail($r['msg'] . '（收件人被服务器拒绝，请检查地址是否被拉黑）');
     }
 
-    $cmd($fp, 'DATA');
+    $r = $send($fp, 'DATA');
+    if (!$r['ok']) {
+        return $r;
+    }
     $r = $expect($fp, [354], 'DATA');
     if (!$r['ok']) {
         return $fail($r['msg']);
     }
 
-    // 邮件正文中的行首点需转义，防止提前结束 DATA
-    $body = preg_replace('/^\./m', '..', $raw);
-    $cmd($fp, rtrim((string)$body, "\r\n") . "\r\n.");
+    // 邮件正文中的行首点需转义，防止提前结束 DATA。
+    // ?? $raw 是必需的：preg_replace 失败返回 null，(string)null 得空串，
+    // 会把含全部邮件头的 $raw 一起清空，发出空正文还可能被服务器判成功。
+    $body = preg_replace('/^\./m', '..', $raw) ?? $raw;
+    $r = $send($fp, rtrim((string)$body, "\r\n") . "\r\n.");
+    if (!$r['ok']) {
+        return $r;
+    }
     $r = $expect($fp, [250], '正文发送');
     if (!$r['ok']) {
         return $fail($r['msg']);
@@ -491,7 +567,12 @@ function mail_notify_admins(array $ticket): void
         . '<p style="margin:0"><strong>提交邮箱：</strong>' . e((string)$ticket['contact_email']) . '</p>'
         . '</div>'
         . '<p style="margin:20px 0"><a href="' . e($link) . '" style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;padding:11px 26px;border-radius:8px;font-weight:600;">进入后台处理</a></p>';
-    mail_queue($to, '【新工单】' . $ticket['ticket_no'] . ' ' . $ticket['title'], $body, (int)$ticket['id']);
+    mail_queue(
+        $to,
+        '【新工单】' . (string)($ticket['ticket_no'] ?? '') . ' ' . (string)($ticket['title'] ?? ''),
+        $body,
+        (int)($ticket['id'] ?? 0)
+    );
 }
 
 /**
@@ -513,8 +594,8 @@ function mail_notify_ticket(array $ticket, string $event, string $extra = ''): v
         return;
     }
 
-    $no    = (string)$ticket['ticket_no'];
-    $title = (string)$ticket['title'];
+    $no    = (string)($ticket['ticket_no'] ?? '');
+    $title = (string)($ticket['title'] ?? '');
     // 邮件里不放访问密钥：用户的密钥由其本人保管，随邮件外发会在转发中泄露。
     // 收件人凭工单编号 + 自己的密钥即可查看。
     $link  = site_url('ticket-view.php?no=' . urlencode($no));
@@ -526,11 +607,11 @@ function mail_notify_ticket(array $ticket, string $event, string $extra = ''): v
         '{hint}'      => '打开链接后，如提示需要验证，请输入工单编号 <b>' . e($no) . '</b> 和你提交时设置的访问密钥。',
         '{time}'      => date('Y-m-d H:i'),
         '{site}'      => e(setting('site_name', '工单中心')),
-        '{status}'    => e(status_meta((string)$ticket['status'])['label']),
+        '{status}'    => e(status_meta((string)($ticket['status'] ?? ''))['label']),
         '{content}'   => $extra,
     ];
     $subject = strtr((string)setting('mail_subject_' . $event, '工单有新进展：' . $no), $map);
     $body    = strtr($tpl, $map);
 
-    mail_queue($email, $subject, $body, (int)$ticket['id']);
+    mail_queue($email, $subject, $body, (int)($ticket['id'] ?? 0));
 }
