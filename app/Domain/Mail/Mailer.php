@@ -206,9 +206,20 @@ final class Mailer
                     secure: in_array($secure, ['ssl', 'tls', 'none'], true) ? $secure : 'ssl',
                     username: trim($this->settings->string('mail_user', '')),
                     password: (string)$this->settings->string('mail_pass', ''),
-                    timeoutSeconds: 15,
+                    // 超时预算是**整个 SMTP 会话**的共享预算，不是每一步各自 15 秒。
+                    //
+                    // 原来的 15 秒对跨境链路明显不够：实测 TLS 握手本身就要
+                    // 4.6 秒、AUTH 登录 1.2 秒，握手合计约 7.2 秒——留给
+                    // MAIL/RCPT/DATA 的只剩不到 8 秒，于是出现
+                    // 「SMTP 服务器响应超时」而邮件其实差点就发出去了。
+                    // 提到 45 秒后，即使链路再慢一倍也有余量。
+                    //
+                    // 这个时长只影响后台任务式的发信，不影响用户感知：
+                    // 响应在发信之前就已返回给浏览器（fastcgi_finish_request）。
+                    timeoutSeconds: 45,
                     verifyPeer: $this->settings->bool('mail_verify_peer', true),
                 );
+                $started = microtime(true);
                 $transport->send([
                     'from' => $from,
                     'fromName' => $this->fromName(),
@@ -218,6 +229,13 @@ final class Mailer
                     'html' => $mail['html'],
                     'text' => $mail['text'],
                 ]);
+                // 记下耗时：排查「邮件慢」时，这一行能区分
+                // 「我们交给 SMTP 很慢」与「投递之后才慢」——两者的处理方式完全不同。
+                \App\Core\Application::log(sprintf(
+                    '[MAIL] 已投递给 SMTP：%s，耗时 %.0f ms',
+                    $mail['to'],
+                    (microtime(true) - $started) * 1000
+                ), 'mail.log');
                 return null;
             }
 
