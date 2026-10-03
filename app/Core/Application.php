@@ -21,6 +21,17 @@ final class Application
 
     private bool $debug = false;
 
+    /**
+     * 日志目录的静态副本，供 shutdown 阶段使用。
+     *
+     * 邮件是在响应之后、由 shutdown 钩子发送的，那时容器可能已经析构，
+     * 静态方法 log() 里通过 Config 读不到 app.log_dir，
+     * 于是记录会回退到 PHP 的错误日志——「邮件投递耗时」这类关键信息
+     * 就落进了 php-error.log，而不是你预期去看的 mail.log。
+     * 这里在构造时把目录留存一份，保证整条生命周期都能写对文件。
+     */
+    private static string $staticLogDir = '';
+
     public function __construct(
         private readonly Container $container,
         private readonly string $basePath,
@@ -28,6 +39,7 @@ final class Application
     ) {
         $this->router = new Router();
         $this->debug = Config::bool('app.debug', false);
+        self::$staticLogDir = $logDir;
     }
 
     public function container(): Container
@@ -94,12 +106,25 @@ final class Application
         });
     }
 
+    /**
+     * 写一条日志。
+     *
+     * 优先使用构造时留存的目录（见 $staticLogDir 的说明）：邮件是在响应之后
+     * 由 shutdown 钩子发送的，那时容器可能已析构，通过 Config 读不到 log_dir，
+     * 记录就会回退到 PHP 的错误日志——「邮件投递耗时」这类关键信息
+     * 会落进 php-error.log，而不是你预期去看的 mail.log。
+     *
+     * 拿不到目录时才退回 PHP 错误日志，绝不静默丢弃：
+     * 丢日志会让「出错了但查不到」再次发生。
+     */
     public static function log(string $message, string $file = 'app.log'): void
     {
-        $dir = Config::string('app.log_dir', '');
+        $dir = self::$staticLogDir;
         if ($dir === '') {
-            // 引导阶段尚未设置 log_dir 时退回 PHP 自身的错误日志，
-            // 而不是静默丢弃——丢日志会让「出错了但查不到」再次发生
+            $dir = Config::string('app.log_dir', '');
+        }
+
+        if ($dir === '') {
             @error_log($message);
             return;
         }
