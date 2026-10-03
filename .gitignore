@@ -1,0 +1,19 @@
+# 敏感配置（含数据库口令与 app_key）
+/config/local.php
+
+# 运行时数据：日志与用户上传
+/storage/logs/*
+!/storage/logs/.gitkeep
+/storage/uploads/*
+!/storage/uploads/.gitkeep
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# 依赖目录（本项目零依赖，留个保险）
+/vendor/
+/node_modules/

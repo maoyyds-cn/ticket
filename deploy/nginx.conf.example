@@ -1,0 +1,138 @@
+# =====================================================================
+#  Roblox 查询机器人 · 工单与知识库系统
+#  nginx 站点配置
+#
+#  部署前请确认三件事，这三处正是旧配置出错的地方：
+#   1) root 指向项目的 public/ 目录，而不是项目根目录；
+#   2) include 的 PHP 版本要与服务器实际安装的一致（本例 8.4）；
+#   3) client_max_body_size 不能小于后台上传上限（默认 10MB×5）。
+#      不设置的话 nginx 默认只有 1MB，任何真实附件都会以 413 失败，
+#      而用户在页面上只会看到「上传失败」，完全无从判断原因。
+#
+#  另外，本项目在 public/ 之外的目录不会通过 Web 暴露，
+#  下面的 deny 规则是第二道防线（万一将来有人把 root 改错）。
+# =====================================================================
+
+server {
+    listen 80;
+    listen 443 ssl;
+    listen 443 quic;
+    http2 on;
+    http3 on;
+
+    server_name t.ili.ink;
+
+    # ★ 只暴露 public/：应用代码、配置、数据库脚本、日志都在它之外
+    root /www/wwwroot/t.ili.ink/public;
+    index index.php;
+
+    charset utf-8;
+
+    # ★ 上传体积：必须 >= 后台上传上限 × 数量
+    client_max_body_size 64m;
+
+    # 证书（宝塔面板申请后路径固定，按实际域名替换）
+    ssl_certificate     /www/server/panel/vhost/cert/t.ili.ink/fullchain.pem;
+    ssl_certificate_key /www/server/panel/vhost/cert/t.ili.ink/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    # HSTS：确认全站 HTTPS 正常后再启用，一旦启用浏览器会记住
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # 安全响应头。（PHP 响应里也会带一份，这里是为了让静态文件同样带上。）
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+
+    # HTTP 跳 HTTPS
+    if ($scheme != "https") {
+        return 301 https://$host$request_uri;
+    }
+
+    # ------------------------------------------------------------------
+    # 第一道防线：即使 root 被误改成项目根目录，这些路径也拿不到东西
+    # ------------------------------------------------------------------
+    location ~* ^/(app|bin|config|database|storage|vendor)(/|$) {
+        return 404;
+    }
+
+    # 隐藏文件（.env、.git、备份文件等）
+    location ~ /\.(?!well-known) {
+        return 404;
+    }
+
+    # 禁止访问常见敏感/备份/开发文件
+    location ~* \.(sql|log|bak|old|swp|ini|md|json|lock|conf|dist)$ {
+        return 404;
+    }
+    location ~* /(README|CHANGELOG|LICENSE|composer) {
+        return 404;
+    }
+
+    # ------------------------------------------------------------------
+    # 上传目录：绝不执行脚本
+    #
+    # 应用层已经用扩展名白名单 + 随机重命名挡住了可执行文件，
+    # 但「允许上传的目录里不能执行 PHP」是必须独立成立的一条规则，
+    # 不能只依赖应用层的白名单——白名单一旦有疏漏就是 RCE。
+    # ------------------------------------------------------------------
+    location ^~ /uploads/ {
+        # 明确关掉 PHP 处理
+        location ~* \.(php|phtml|phar|php[0-9]|shtml|cgi|pl|py|sh|asp|aspx|jsp)$ {
+            return 404;
+        }
+        # 附件里的文本类文件（txt/log/json/csv）加 nosniff，
+        # 避免浏览器把它们当 HTML 解析
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Content-Disposition "inline" always;
+        expires 7d;
+        access_log off;
+    }
+
+    # ------------------------------------------------------------------
+    # 静态资源缓存
+    # ------------------------------------------------------------------
+    location ~* \.(css|js|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|mp4|webm|mp3)$ {
+        expires 30d;
+        access_log off;
+        add_header Cache-Control "public, max-age=2592000, immutable";
+    }
+
+    # ------------------------------------------------------------------
+    # 前端控制器
+    #
+    # 所有请求都交给 public/index.php，由应用内路由分发。
+    # try_files 的最后一项是 /index.php?$query_string，
+    # 注意不能写成 /index.php$is_args$args 之外的形式，
+    # 否则查询参数会丢失（登录回跳、分页、筛选都会失效）。
+    # ------------------------------------------------------------------
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        # ★ 版本必须与服务器实际安装的 PHP 一致
+        include enable-php-84.conf;
+    }
+
+    # 健康检查端点（可选，便于外部监控）
+    location = /favicon.ico {
+        access_log off;
+        log_not_found off;
+    }
+
+    location = /robots.txt {
+        access_log off;
+        log_not_found off;
+    }
+
+    access_log /www/wwwlogs/t.ili.ink.log;
+    error_log  /www/wwwlogs/t.ili.ink.error.log;
+}

@@ -1,0 +1,4 @@
+# 阻止通过 Web 访问 storage 目录下的任何内容。
+# 这份文件只在 Apache 下生效；nginx 需要在站点配置里加对应的 location 规则
+# （见 deploy/nginx.conf.example）。
+Require all denied
